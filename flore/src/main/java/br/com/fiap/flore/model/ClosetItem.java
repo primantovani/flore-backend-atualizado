@@ -18,7 +18,8 @@ public class ClosetItem {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(nullable = false)
+    // Nomes de coluna batem com a tabela CLOSET_ITEMS do Oracle (db/01_tabelas.sql).
+    @Column(name = "item_name", nullable = false)
     private String name;
 
     // ex: camiseta, calca, vestido, casaco, sapato...
@@ -32,10 +33,11 @@ public class ClosetItem {
     private String description;
 
     // Usado pelo painel admin em Angular (campo "tamanho"). Opcional pro Flutter.
+    @Column(name = "item_size")
     private String size;
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @Column(name = "item_status", nullable = false)
     @Builder.Default
     private ClosetItemStatus status = ClosetItemStatus.AVAILABLE;
 

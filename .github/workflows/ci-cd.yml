@@ -1,0 +1,268 @@
+# Pipeline CI/CD do backend Florê (Fase 7 - DevOps & DevSecOps).
+#
+#   build-test  -> compila e roda os testes automatizados (H2 em memoria)
+#   oracle      -> sobe um Oracle Free, aplica db/*.sql, testa as rotinas PL/SQL
+#                  e roda a API de verdade contra esse banco
+#   docker      -> gera a imagem e publica no GitHub Container Registry
+#   deploy      -> (so na main) aplica os scripts no Oracle de producao e
+#                  dispara o deploy no Render, conferindo a saude no final
+#
+# Cada job publica logs e relatorios como artifacts e escreve um resumo na
+# pagina da execucao (aba Summary).
+
+name: CI/CD Florê
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build e testes
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: flore
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build + testes (mvn verify)
+        run: |
+          chmod +x mvnw
+          ./mvnw -B verify 2>&1 | tee ../build.log
+
+      - name: Resumo dos testes
+        if: always()
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import glob, xml.etree.ElementTree as ET
+          total = falhas = erros = puladas = 0
+          linhas = []
+          for f in sorted(glob.glob('target/surefire-reports/TEST-*.xml')):
+              s = ET.parse(f).getroot()
+              t, fa, e, p = (int(s.get(k, 0)) for k in ('tests', 'failures', 'errors', 'skipped'))
+              total += t; falhas += fa; erros += e; puladas += p
+              ok = 'OK' if fa + e == 0 else 'FALHOU'
+              linhas.append(f"| {s.get('name').split('.')[-1]} | {t} | {fa + e} | {ok} |")
+          print('## Testes automatizados (backend)\n')
+          print(f'**{total} testes**, {falhas + erros} falhas, {puladas} pulados\n')
+          print('| Classe | Testes | Falhas | Status |\n| --- | --- | --- | --- |')
+          print('\n'.join(linhas))
+          EOF
+
+      - name: Publicar relatórios de teste
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorio-testes
+          path: |
+            flore/target/surefire-reports/
+            build.log
+          retention-days: 30
+
+      - name: Publicar jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: flore-jar
+          path: flore/target/flore-*.jar
+          retention-days: 7
+
+  oracle:
+    name: Oracle + PL/SQL + API integrada
+    needs: build-test
+    runs-on: ubuntu-latest
+    services:
+      oracle:
+        image: gvenzl/oracle-free:23-slim-faststart
+        env:
+          # Banco descartavel, vive so durante o job.
+          ORACLE_PASSWORD: ci_admin_pwd
+          APP_USER: flore
+          APP_USER_PASSWORD: flore_ci_pwd
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ORACLE_CONN: flore/flore_ci_pwd@//localhost:1521/FREEPDB1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Aplicar scripts do banco (db/*.sql)
+        run: ci/run-sql.sh "${{ job.services.oracle.id }}" "$ORACLE_CONN" db/*.sql
+
+      - name: Testar rotinas PL/SQL
+        run: ci/run-sql.sh "${{ job.services.oracle.id }}" "$ORACLE_CONN" ci/oracle-smoke.sql
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: flore-jar
+          path: app
+
+      - name: Subir a API conectada ao Oracle
+        env:
+          SPRING_PROFILES_ACTIVE: oracle
+          ORACLE_URL: jdbc:oracle:thin:@//localhost:1521/FREEPDB1
+          ORACLE_USER: flore
+          ORACLE_PASSWORD: flore_ci_pwd
+          FLORE_JWT_SECRET: segredo-so-do-pipeline-com-mais-de-32-caracteres
+        run: |
+          mkdir -p ci-logs
+          nohup java -jar app/flore-*.jar > ci-logs/api.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://localhost:8080/api/closet; then
+              echo "API no ar depois de ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::API nao subiu em 60s"; cat ci-logs/api.log; exit 1
+
+      - name: Testar API contra o Oracle
+        run: ci/smoke-api.sh http://localhost:8080
+
+      - name: Conferir dados gravados no Oracle
+        run: |
+          email=$(cat ci-logs/smoke-email.txt)
+          cat > /tmp/confere.sql <<EOF
+          SET HEADING OFF FEEDBACK OFF
+          SELECT 'usuarios=' || COUNT(*) FROM USERS WHERE EMAIL = '$email';
+          SELECT 'pecas=' || COUNT(*) FROM CLOSET_ITEMS C JOIN USERS U ON U.ID = C.OWNER_ID WHERE U.EMAIL = '$email';
+          EOF
+          ci/run-sql.sh "${{ job.services.oracle.id }}" "$ORACLE_CONN" /tmp/confere.sql
+          grep -q 'usuarios=1' ci-logs/sql/confere.sql.log
+          grep -q 'pecas=1' ci-logs/sql/confere.sql.log
+          echo "Usuario e peca criados pela API estao gravados no Oracle."
+
+      - name: Resumo da integração
+        if: always()
+        run: |
+          {
+            echo '## Oracle + PL/SQL + API'
+            echo
+            echo '**Scripts aplicados:**'
+            for f in db/*.sql; do echo "- \`$f\`"; done
+            echo
+            echo '**Rotinas PL/SQL:**'
+            echo '```'; grep -E '^OK|FALHOU' ci-logs/sql/oracle-smoke.sql.log || true; echo '```'
+            echo '**API contra o Oracle:**'
+            echo '```'; grep -E '^OK|FALHOU' ci-logs/smoke-api.log || true; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-oracle-api
+          path: ci-logs/
+          retention-days: 30
+
+  docker:
+    name: Imagem Docker
+    needs: oracle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login no GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (e push na main)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/flore-backend:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/flore-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resumo
+        run: |
+          echo "## Imagem Docker" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`ghcr.io/${{ github.repository_owner }}/flore-backend:${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      PROD_ORACLE_CONN: ${{ secrets.PROD_ORACLE_CONN }}
+      RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+      PROD_API_URL: ${{ vars.PROD_API_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Aplicar scripts no Oracle de produção
+        if: env.PROD_ORACLE_CONN != ''
+        run: |
+          # Cliente sqlplus da mesma imagem do CI, conectando no banco de producao.
+          docker run --rm -v "$PWD/db:/db" --entrypoint bash gvenzl/oracle-free:23-slim-faststart -c '
+            for f in /db/*.sql; do
+              echo "== $f"
+              printf "WHENEVER SQLERROR EXIT SQL.SQLCODE\n@%s\nEXIT\n" "$f" | sqlplus -s "$0" || exit 1
+            done' "$PROD_ORACLE_CONN" | tee deploy-db.log
+
+      - name: Disparar deploy no Render
+        if: env.RENDER_DEPLOY_HOOK_URL != ''
+        run: curl -sf -X POST "$RENDER_DEPLOY_HOOK_URL" > /dev/null && echo "Deploy disparado."
+
+      - name: Conferir saúde da API publicada
+        if: env.PROD_API_URL != '' && env.RENDER_DEPLOY_HOOK_URL != ''
+        run: |
+          # O Render leva alguns minutos pra trocar a versao.
+          for i in $(seq 1 30); do
+            if curl -sf "$PROD_API_URL/api/closet" > /dev/null; then
+              echo "API em producao respondendo."; exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::API em producao nao respondeu em 10 min"; exit 1
+
+      - name: Resumo do deploy
+        if: always()
+        run: |
+          {
+            echo '## Deploy'
+            [ -n "$PROD_ORACLE_CONN" ] && echo '- Scripts aplicados no Oracle de produção' \
+              || echo '- Oracle de produção: secret `PROD_ORACLE_CONN` não configurado, etapa pulada'
+            [ -n "$RENDER_DEPLOY_HOOK_URL" ] && echo '- Deploy disparado no Render' \
+              || echo '- Render: secret `RENDER_DEPLOY_HOOK_URL` não configurado, etapa pulada'
+            echo "- Imagem: \`ghcr.io/${{ github.repository_owner }}/flore-backend:${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
