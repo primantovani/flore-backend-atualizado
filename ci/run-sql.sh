@@ -20,7 +20,8 @@ for arquivo in "$@"; do
     exit 1
   fi
   # sqlplus -s pode sair 0 com erro de compilacao (Warning: ... created with compilation errors).
-  if grep -q -E 'compilation errors|ORA-[0-9]+|SP2-[0-9]+' "ci-logs/sql/$nome.log"; then
+  # So linha que comeca com o codigo e erro; "OK ... (ORA-20001)" do smoke test e esperado.
+  if grep -q -E 'compilation errors|^ERROR at line|^(ORA|SP2|PLS)-[0-9]+' "ci-logs/sql/$nome.log"; then
     echo "::error file=$arquivo::Erro no script $nome (ver ci-logs/sql/$nome.log)"
     exit 1
   fi
