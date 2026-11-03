@@ -113,6 +113,19 @@ jobs:
       - name: Testar rotinas PL/SQL
         run: ci/run-sql.sh "${{ job.services.oracle.id }}" "$ORACLE_CONN" ci/oracle-smoke.sql
 
+      - name: Evidências da Parte 1 (package, trigger, Dynamic SQL)
+        run: |
+          ci/run-sql.sh "${{ job.services.oracle.id }}" "$ORACLE_CONN" ci/oracle-demo-parte1.sql
+          log=ci-logs/sql/oracle-demo-parte1.sql.log
+          {
+            for secao in '2.1 PACKAGE PKG_FLORE' '2.2 TRIGGER DE AUDITORIA' '2.3 DYNAMIC SQL'; do
+              echo "## Parte 1 – ${secao}"
+              echo '```'
+              awk -v s="===== ${secao} =====" '$0==s{on=1;next} /^===== /{on=0} on' "$log" | sed '/^[[:space:]]*$/N;/^\n$/D'
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
